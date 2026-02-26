@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Generated outputs
+plots_py/
+benchmark_runs/
+research_runs/
+research_runs_jax/
+tmp_research_smoke/
+tmp*/
+jax_benchmark/
