@@ -9,4 +9,3 @@ research_runs/
 research_runs_jax/
 tmp_research_smoke/
 tmp*/
-jax_benchmark/
