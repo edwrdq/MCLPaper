@@ -56,9 +56,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run aggressive MCL research benchmarks with JAX")
     parser.add_argument(
         "--study-mode",
-        choices=["standard", "collision_ablation"],
+        choices=[
+            "standard",
+            "collision_ablation",
+            "adaptive_noise_ablation",
+            "adaptive_noise_sensitivity",
+        ],
         default="standard",
-        help="Standard suite or collision ablation (with/without spontaneous collisions).",
+        help=(
+            "Benchmark mode: standard, collision ablation, adaptive-noise ablation, "
+            "or adaptive-noise parameter sensitivity sweep."
+        ),
     )
     parser.add_argument("--trials-per-condition", type=int, default=20, help="Trials for each condition")
     parser.add_argument("--trial-batch", type=int, default=8, help="JAX lockstep trial batch size")
@@ -91,12 +99,66 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive-noise-beta", type=float, default=0.2)
     parser.add_argument("--adaptive-noise-smoothing", action="store_true")
     parser.add_argument("--adaptive-noise-damping", type=float, default=0.0)
+    parser.add_argument(
+        "--ablation-regime",
+        choices=["no_collision", "with_collision", "both"],
+        default="both",
+        help="Regime(s) to run for adaptive-noise ablation mode.",
+    )
+    parser.add_argument(
+        "--ablation-include-smoothing-toggle",
+        action="store_true",
+        help="In ablation mode, include explicit raw-vs-smoothed adaptive-noise variants.",
+    )
+    parser.add_argument(
+        "--sensitivity-regime",
+        choices=["no_collision", "with_collision", "both"],
+        default="both",
+        help="Regime(s) to run for adaptive-noise sensitivity mode.",
+    )
+    parser.add_argument(
+        "--sensitivity-alpha-grid",
+        type=str,
+        default="0.05,0.1,0.2,0.5",
+        help="Comma-separated alpha values for adaptive-noise sensitivity sweep.",
+    )
+    parser.add_argument(
+        "--sensitivity-beta-grid",
+        type=str,
+        default="0.01,0.05,0.1,0.2",
+        help="Comma-separated beta values for adaptive-noise sensitivity sweep.",
+    )
+    parser.add_argument(
+        "--sensitivity-gamma-grid",
+        type=str,
+        default="0.0,0.6,0.8",
+        help="Comma-separated damping gamma values for adaptive-noise sensitivity sweep.",
+    )
+    parser.add_argument(
+        "--sensitivity-configs",
+        type=str,
+        default="",
+        help=(
+            "Optional explicit sensitivity configs as comma-separated alpha:beta:gamma "
+            "triples (overrides grid), e.g. '0.1:0.05:0.8,0.2:0.1:0.6'."
+        ),
+    )
+    parser.add_argument(
+        "--sensitivity-include-baseline",
+        action="store_true",
+        help="In sensitivity mode, include a baseline fixed-noise condition.",
+    )
 
     parser.add_argument("--ess-threshold", type=float, default=0.4, help="ESS threshold (ratio if <=1)")
     parser.add_argument("--ess-high-ratio", type=float, default=0.85)
     parser.add_argument("--particle-growth-factor", type=float, default=1.5)
     parser.add_argument("--particle-shrink-step", type=int, default=50)
     parser.add_argument("--max-particles", type=int, default=2_000)
+    parser.add_argument(
+        "--paired-condition-seeds",
+        action="store_true",
+        help="Use identical per-trial seed schedules across conditions within each scenario.",
+    )
 
     parser.add_argument("--no-rich", action="store_true", help="Disable Rich terminal output")
     return parser.parse_args()
@@ -163,7 +225,7 @@ def make_base_params(args: argparse.Namespace) -> Params:
     return params
 
 
-def condition_params(base: Params, name: str) -> Params:
+def clone_params(base: Params) -> Params:
     p = Params(**asdict(base))
     p.world = np.array(base.world, dtype=float)
     p.x0_true = np.array(base.x0_true, dtype=float)
@@ -174,8 +236,6 @@ def condition_params(base: Params, name: str) -> Params:
     p.ang_velocity_limits = np.array(base.ang_velocity_limits, dtype=float)
     p.velocity_reversion_gain = np.array(base.velocity_reversion_gain, dtype=float)
     p.collision_speed_loss_range = np.array(base.collision_speed_loss_range, dtype=float)
-    p.adaptive_noise = name in {"adaptive_noise", "adaptive_both"}
-    p.adaptive_particles = name in {"adaptive_particles", "adaptive_both"}
     # Copy analysis-only dynamic attributes (not part of Params dataclass fields).
     for attr in [
         "collision_peak_window",
@@ -190,11 +250,251 @@ def condition_params(base: Params, name: str) -> Params:
     return p
 
 
+def condition_params(base: Params, name: str) -> Params:
+    p = clone_params(base)
+    p.adaptive_noise = name in {"adaptive_noise", "adaptive_both"}
+    p.adaptive_particles = name in {"adaptive_particles", "adaptive_both"}
+    return p
+
+
+def _parse_float_grid(grid_text: str, arg_name: str) -> list[float]:
+    values: list[float] = []
+    for raw in grid_text.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        values.append(float(token))
+    if not values:
+        raise ValueError(f"{arg_name} must contain at least one numeric value.")
+    return values
+
+
+def _parse_sensitivity_configs(config_text: str) -> list[tuple[float, float, float]]:
+    configs: list[tuple[float, float, float]] = []
+    if not config_text.strip():
+        return configs
+    for raw_item in config_text.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        parts = [p.strip() for p in item.split(":")]
+        if len(parts) != 3:
+            raise ValueError(
+                "Invalid --sensitivity-configs entry. Expected alpha:beta:gamma triples, "
+                f"got '{item}'."
+            )
+        alpha, beta, gamma = (float(parts[0]), float(parts[1]), float(parts[2]))
+        configs.append((alpha, beta, gamma))
+    if not configs:
+        raise ValueError("--sensitivity-configs was provided but no valid triples were parsed.")
+    return configs
+
+
+def _scenario_list_from_regime(regime: str) -> list[tuple[str, bool]]:
+    if regime == "no_collision":
+        return [("no_collision", False)]
+    if regime == "with_collision":
+        return [("with_collision", True)]
+    return [("no_collision", False), ("with_collision", True)]
+
+
+def _float_tag(value: float) -> str:
+    sign = "m" if value < 0.0 else ""
+    mag = abs(float(value))
+    text = f"{mag:.4f}".rstrip("0").rstrip(".")
+    if not text:
+        text = "0"
+    return f"{sign}{text.replace('.', 'p')}"
+
+
+def build_adaptive_noise_ablation_conditions(
+    base: Params,
+    include_smoothing_toggle: bool,
+) -> list[tuple[str, Params, dict[str, float | str]]]:
+    conditions: list[tuple[str, Params, dict[str, float | str]]] = []
+
+    baseline = clone_params(base)
+    baseline.adaptive_noise = False
+    baseline.adaptive_particles = False
+    conditions.append(
+        (
+            "baseline",
+            baseline,
+            {
+                "adaptive_noise_alpha": 0.0,
+                "adaptive_noise_beta": 0.0,
+                "adaptive_noise_gamma": 0.0,
+                "adaptive_noise_smoothing_enabled": "false",
+            },
+        )
+    )
+
+    alpha_only = clone_params(base)
+    alpha_only.adaptive_noise = True
+    alpha_only.adaptive_particles = False
+    alpha_only.adaptive_noise_beta = 0.0
+    conditions.append(
+        (
+            "noise_alpha_only",
+            alpha_only,
+            {
+                "adaptive_noise_alpha": float(alpha_only.adaptive_noise_alpha),
+                "adaptive_noise_beta": 0.0,
+                "adaptive_noise_gamma": float(alpha_only.adaptive_noise_damping) if alpha_only.adaptive_noise_smoothing else 0.0,
+                "adaptive_noise_smoothing_enabled": str(bool(alpha_only.adaptive_noise_smoothing)).lower(),
+            },
+        )
+    )
+
+    beta_only = clone_params(base)
+    beta_only.adaptive_noise = True
+    beta_only.adaptive_particles = False
+    beta_only.adaptive_noise_alpha = 0.0
+    conditions.append(
+        (
+            "noise_jerk_only",
+            beta_only,
+            {
+                "adaptive_noise_alpha": 0.0,
+                "adaptive_noise_beta": float(beta_only.adaptive_noise_beta),
+                "adaptive_noise_gamma": float(beta_only.adaptive_noise_damping) if beta_only.adaptive_noise_smoothing else 0.0,
+                "adaptive_noise_smoothing_enabled": str(bool(beta_only.adaptive_noise_smoothing)).lower(),
+            },
+        )
+    )
+
+    both = clone_params(base)
+    both.adaptive_noise = True
+    both.adaptive_particles = False
+    conditions.append(
+        (
+            "noise_alpha_jerk",
+            both,
+            {
+                "adaptive_noise_alpha": float(both.adaptive_noise_alpha),
+                "adaptive_noise_beta": float(both.adaptive_noise_beta),
+                "adaptive_noise_gamma": float(both.adaptive_noise_damping) if both.adaptive_noise_smoothing else 0.0,
+                "adaptive_noise_smoothing_enabled": str(bool(both.adaptive_noise_smoothing)).lower(),
+            },
+        )
+    )
+
+    if include_smoothing_toggle:
+        raw = clone_params(base)
+        raw.adaptive_noise = True
+        raw.adaptive_particles = False
+        raw.adaptive_noise_smoothing = False
+        raw.adaptive_noise_damping = 0.0
+        conditions.append(
+            (
+                "noise_alpha_jerk_raw",
+                raw,
+                {
+                    "adaptive_noise_alpha": float(raw.adaptive_noise_alpha),
+                    "adaptive_noise_beta": float(raw.adaptive_noise_beta),
+                    "adaptive_noise_gamma": 0.0,
+                    "adaptive_noise_smoothing_enabled": "false",
+                },
+            )
+        )
+
+        smoothed = clone_params(base)
+        smoothed.adaptive_noise = True
+        smoothed.adaptive_particles = False
+        smoothed.adaptive_noise_smoothing = True
+        if smoothed.adaptive_noise_damping <= 0.0:
+            smoothed.adaptive_noise_damping = 0.8
+        conditions.append(
+            (
+                "noise_alpha_jerk_smoothed",
+                smoothed,
+                {
+                    "adaptive_noise_alpha": float(smoothed.adaptive_noise_alpha),
+                    "adaptive_noise_beta": float(smoothed.adaptive_noise_beta),
+                    "adaptive_noise_gamma": float(smoothed.adaptive_noise_damping),
+                    "adaptive_noise_smoothing_enabled": "true",
+                },
+            )
+        )
+
+    return conditions
+
+
+def build_adaptive_noise_sensitivity_conditions(
+    base: Params,
+    alpha_grid: list[float],
+    beta_grid: list[float],
+    gamma_grid: list[float],
+    include_baseline: bool,
+    explicit_configs: list[tuple[float, float, float]] | None = None,
+) -> list[tuple[str, Params, dict[str, float | str]]]:
+    conditions: list[tuple[str, Params, dict[str, float | str]]] = []
+
+    if include_baseline:
+        baseline = clone_params(base)
+        baseline.adaptive_noise = False
+        baseline.adaptive_particles = False
+        conditions.append(
+            (
+                "baseline",
+                baseline,
+                {
+                    "adaptive_noise_alpha": 0.0,
+                    "adaptive_noise_beta": 0.0,
+                    "adaptive_noise_gamma": 0.0,
+                    "adaptive_noise_smoothing_enabled": "false",
+                },
+            )
+        )
+
+    if explicit_configs is None:
+        triplets = [(a, b, g) for a in alpha_grid for b in beta_grid for g in gamma_grid]
+    else:
+        triplets = list(explicit_configs)
+
+    seen_triplets: set[tuple[float, float, float]] = set()
+    for alpha, beta, gamma in triplets:
+        gamma_clipped = float(np.clip(gamma, 0.0, 1.0))
+        key = (float(alpha), float(beta), gamma_clipped)
+        if key in seen_triplets:
+            continue
+        seen_triplets.add(key)
+
+        p = clone_params(base)
+        p.adaptive_noise = True
+        p.adaptive_particles = False
+        p.adaptive_noise_alpha = float(alpha)
+        p.adaptive_noise_beta = float(beta)
+        p.adaptive_noise_smoothing = gamma_clipped > 0.0
+        p.adaptive_noise_damping = gamma_clipped
+
+        cond_name = (
+            f"noise_a{_float_tag(alpha)}_"
+            f"b{_float_tag(beta)}_"
+            f"g{_float_tag(gamma_clipped)}"
+        )
+        conditions.append(
+            (
+                cond_name,
+                p,
+                {
+                    "adaptive_noise_alpha": float(alpha),
+                    "adaptive_noise_beta": float(beta),
+                    "adaptive_noise_gamma": float(gamma_clipped),
+                    "adaptive_noise_smoothing_enabled": str(bool(p.adaptive_noise_smoothing)).lower(),
+                },
+            )
+        )
+    return conditions
+
+
 def write_condition_outputs(
     out_dir: Path,
     params: Params,
     rows: list[dict[str, float | int]],
     histories: dict[str, list[np.ndarray]],
+    *,
+    save_npz: bool = True,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -204,25 +504,26 @@ def write_condition_outputs(
         writer.writeheader()
         writer.writerows(rows)
 
-    np.savez(
-        out_dir / "metrics.npz",
-        trial=np.array([r["trial"] for r in rows], dtype=int),
-        seed=np.array([r["seed"] for r in rows], dtype=int),
-        final_step_rmse=np.array([r["final_step_rmse"] for r in rows], dtype=float),
-        mean_rmse=np.array([r["mean_rmse"] for r in rows], dtype=float),
-        min_rmse=np.array([r["min_rmse"] for r in rows], dtype=float),
-        max_rmse=np.array([r["max_rmse"] for r in rows], dtype=float),
-        runtime_s=np.array([r["runtime_s"] for r in rows], dtype=float),
-        rmse_history=np.stack(histories["rmse_history"], axis=0),
-        sigma_t_history=np.stack(histories["sigma_t_history"], axis=0),
-        ess_history=np.stack(histories["ess_history"], axis=0),
-        particle_count_history=np.stack(histories["particle_count_history"], axis=0),
-        accel_history=np.stack(histories["accel_history"], axis=0),
-        jerk_history=np.stack(histories["jerk_history"], axis=0),
-        accel_mag_history=np.stack(histories["accel_mag_history"], axis=0),
-        jerk_mag_history=np.stack(histories["jerk_mag_history"], axis=0),
-        collision_history=np.stack(histories["collision_history"], axis=0),
-    )
+    if save_npz:
+        np.savez(
+            out_dir / "metrics.npz",
+            trial=np.array([r["trial"] for r in rows], dtype=int),
+            seed=np.array([r["seed"] for r in rows], dtype=int),
+            final_step_rmse=np.array([r["final_step_rmse"] for r in rows], dtype=float),
+            mean_rmse=np.array([r["mean_rmse"] for r in rows], dtype=float),
+            min_rmse=np.array([r["min_rmse"] for r in rows], dtype=float),
+            max_rmse=np.array([r["max_rmse"] for r in rows], dtype=float),
+            runtime_s=np.array([r["runtime_s"] for r in rows], dtype=float),
+            rmse_history=np.stack(histories["rmse_history"], axis=0),
+            sigma_t_history=np.stack(histories["sigma_t_history"], axis=0),
+            ess_history=np.stack(histories["ess_history"], axis=0),
+            particle_count_history=np.stack(histories["particle_count_history"], axis=0),
+            accel_history=np.stack(histories["accel_history"], axis=0),
+            jerk_history=np.stack(histories["jerk_history"], axis=0),
+            accel_mag_history=np.stack(histories["accel_mag_history"], axis=0),
+            jerk_mag_history=np.stack(histories["jerk_mag_history"], axis=0),
+            collision_history=np.stack(histories["collision_history"], axis=0),
+        )
 
     config_lines = [
         "backend=jax",
@@ -1076,7 +1377,9 @@ def run_condition(
     console: Console,
     use_rich: bool,
     trial_batch: int,
-) -> dict[str, float]:
+    summary_meta: dict[str, float | str] | None = None,
+    save_npz: bool = True,
+) -> dict[str, float | str]:
     cond_dir = out_root / name
     rows: list[dict[str, float | int]] = []
     histories = {
@@ -1153,7 +1456,7 @@ def run_condition(
         for key in histories:
             histories[key] = [histories[key][i] for i in order]
 
-    write_condition_outputs(cond_dir, params, rows, histories)
+    write_condition_outputs(cond_dir, params, rows, histories, save_npz=save_npz)
 
     summary = {
         "condition": name,
@@ -1176,6 +1479,8 @@ def run_condition(
                 "mean_collision_recovery_success_rate": _nanmean_or_nan([m["collision_recovery_success_rate"] for m in cm]),
             }
         )
+    if summary_meta is not None:
+        summary.update(summary_meta)
 
     if use_rich:
         table = Table(title=f"Condition: {name} (JAX)")
@@ -1205,10 +1510,58 @@ def main() -> None:
     args = parse_args()
     use_rich = not args.no_rich
     console = Console()
+    if int(args.trials_per_condition) <= 0:
+        raise ValueError("--trials-per-condition must be >= 1.")
+    trial_batch = max(1, int(args.trial_batch))
 
     base = make_base_params(args)
-    conditions = ["baseline", "adaptive_noise", "adaptive_particles", "adaptive_both"]
-    scenarios = [("standard", False)] if args.study_mode == "standard" else [("no_collision", False), ("with_collision", True)]
+    if args.study_mode == "standard":
+        scenarios = [("standard", False)]
+        run_plan: list[tuple[str, Params, dict[str, float | str] | None]] = [
+            ("baseline", condition_params(base, "baseline"), None),
+            ("adaptive_noise", condition_params(base, "adaptive_noise"), None),
+            ("adaptive_particles", condition_params(base, "adaptive_particles"), None),
+            ("adaptive_both", condition_params(base, "adaptive_both"), None),
+        ]
+    elif args.study_mode == "collision_ablation":
+        scenarios = [("no_collision", False), ("with_collision", True)]
+        run_plan = [
+            ("baseline", condition_params(base, "baseline"), None),
+            ("adaptive_noise", condition_params(base, "adaptive_noise"), None),
+            ("adaptive_particles", condition_params(base, "adaptive_particles"), None),
+            ("adaptive_both", condition_params(base, "adaptive_both"), None),
+        ]
+    elif args.study_mode == "adaptive_noise_ablation":
+        scenarios = _scenario_list_from_regime(args.ablation_regime)
+        run_plan = [
+            (name, params, meta)
+            for name, params, meta in build_adaptive_noise_ablation_conditions(
+                base,
+                include_smoothing_toggle=bool(args.ablation_include_smoothing_toggle),
+            )
+        ]
+    else:
+        scenarios = _scenario_list_from_regime(args.sensitivity_regime)
+        explicit_configs = _parse_sensitivity_configs(args.sensitivity_configs)
+        if explicit_configs:
+            alpha_grid = [cfg[0] for cfg in explicit_configs]
+            beta_grid = [cfg[1] for cfg in explicit_configs]
+            gamma_grid = [cfg[2] for cfg in explicit_configs]
+        else:
+            alpha_grid = _parse_float_grid(args.sensitivity_alpha_grid, "--sensitivity-alpha-grid")
+            beta_grid = _parse_float_grid(args.sensitivity_beta_grid, "--sensitivity-beta-grid")
+            gamma_grid = _parse_float_grid(args.sensitivity_gamma_grid, "--sensitivity-gamma-grid")
+        run_plan = [
+            (name, params, meta)
+            for name, params, meta in build_adaptive_noise_sensitivity_conditions(
+                base,
+                alpha_grid=alpha_grid,
+                beta_grid=beta_grid,
+                gamma_grid=gamma_grid,
+                include_baseline=bool(args.sensitivity_include_baseline),
+                explicit_configs=(explicit_configs if explicit_configs else None),
+            )
+        ]
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_root = Path(args.output_dir) / f"aggressive_suite_{run_id}"
@@ -1219,8 +1572,9 @@ def main() -> None:
             Panel(
                 f"Running JAX MCL research suite\n"
                 f"study_mode={args.study_mode}\n"
-                f"scenarios={len(scenarios)} conditions={len(conditions)} trials/condition={args.trials_per_condition}\n"
-                f"trial_batch={max(1, int(args.trial_batch))}\n"
+                f"scenarios={len(scenarios)} conditions={len(run_plan)} trials/condition={args.trials_per_condition}\n"
+                f"trial_batch={trial_batch}\n"
+                f"paired_condition_seeds={bool(args.paired_condition_seeds)}\n"
                 f"jax_devices={[str(d) for d in jax.devices()]}\n"
                 f"room={args.room_size}m x {args.room_size}m, particles={args.particles}, steps={args.steps}",
                 title="Research Benchmark (JAX)",
@@ -1228,14 +1582,17 @@ def main() -> None:
             )
         )
 
-    summaries: list[dict[str, float]] = []
+    summaries: list[dict[str, float | str]] = []
     for scenario_idx, (scenario_name, collisions_enabled) in enumerate(scenarios):
         scenario_root = out_root if scenario_name == "standard" else (out_root / scenario_name)
         scenario_root.mkdir(parents=True, exist_ok=True)
-        for cond_idx, cond_name in enumerate(conditions):
-            params = condition_params(base, cond_name)
+        for cond_idx, (cond_name, params_template, summary_meta) in enumerate(run_plan):
+            params = clone_params(params_template)
             params.spontaneous_collisions = bool(collisions_enabled)
-            cond_seed = args.seed + scenario_idx * 1_000_000 + cond_idx * 100_000
+            if args.paired_condition_seeds:
+                cond_seed = args.seed + scenario_idx * 1_000_000
+            else:
+                cond_seed = args.seed + scenario_idx * 1_000_000 + cond_idx * 100_000
             summary = run_condition(
                 cond_name,
                 params,
@@ -1244,14 +1601,26 @@ def main() -> None:
                 out_root=scenario_root,
                 console=console,
                 use_rich=use_rich,
-                trial_batch=args.trial_batch,
+                trial_batch=trial_batch,
+                summary_meta=summary_meta,
+                save_npz=(args.study_mode != "adaptive_noise_sensitivity"),
             )
             summary["scenario"] = scenario_name
             summaries.append(summary)
 
+    if not summaries:
+        raise RuntimeError("No summaries were produced; check study mode and parameter grids.")
+
     summary_csv = out_root / "summary.csv"
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in summaries:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
     with summary_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(summaries[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(summaries)
 
